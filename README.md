@@ -2,7 +2,7 @@
 
 [![Go Doc Badge]][Go Doc] [![Go Report Card Badge]][Go Report Card]
 
-Drive helpers for Windows.
+List physical drives on Windows, including partitions and filesystem information.
 
 [Go Doc]: https://pkg.go.dev/github.com/Desuuuu/windrive
 [Go Doc Badge]: https://pkg.go.dev/badge/github.com/Desuuuu/windrive.svg

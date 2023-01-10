@@ -4,111 +4,246 @@
 package windrive
 
 import (
+	"errors"
+	"fmt"
+	"strings"
+	"unsafe"
+
 	"golang.org/x/sys/windows"
 )
 
-type DriveType int
-
-const (
-	DriveTypeInvalid DriveType = iota
-	DriveTypeRemovable
-	DriveTypeFixed
-	DriveTypeRemote
-	DriveTypeCDRom
-	DriveTypeRAMDisk
-)
-
 type Drive struct {
+	Name       string
 	Path       string
-	Type       DriveType
-	VolumeName string
-	FileSystem FileSystem
+	Partitions []*Partition
 }
 
-type FileSystem struct {
-	Name               string
-	Flags              uint32
-	MaxComponentLength uint32
+func (d Drive) String() string {
+	return d.Name
 }
 
-func (fs FileSystem) IsReadOnly() bool {
-	return (fs.Flags & windows.FILE_READ_ONLY_VOLUME) != 0
-}
-
-// List returns the list of available drives, optionally filtered by type.
-func List(driveTypes ...DriveType) ([]*Drive, error) {
-	drivePaths, err := getDrivePaths()
+// List returns the physical drives currently connected. Drives without any
+// partition are not included.
+func List() ([]*Drive, error) {
+	partitionsPath, err := getPartitionsPath()
 	if err != nil {
 		return nil, err
 	}
 
-	var res []*Drive
+	drives := make(map[string]*Drive)
 
-	filter := make(map[DriveType]struct{}, len(driveTypes))
-	for _, driveType := range driveTypes {
-		filter[driveType] = struct{}{}
-	}
-
-	for _, drivePath := range drivePaths {
-		driveType := getDriveType(windows.GetDriveType(&drivePath[0]))
-		if driveType == DriveTypeInvalid {
+	for _, partitionPath := range partitionsPath {
+		driveType := windows.GetDriveType(&partitionPath[0])
+		if driveType != windows.DRIVE_REMOVABLE && driveType != windows.DRIVE_FIXED {
 			continue
 		}
 
-		if len(filter) > 0 {
-			if _, ok := filter[driveType]; !ok {
-				continue
-			}
-		}
-
-		volumeName, fileSystem, err := getVolumeInformation(&drivePath[0])
+		name, fileSystem, err := getPartitionInformation(&partitionPath[0])
 		if err != nil {
 			continue
 		}
 
-		res = append(res, &Drive{
-			Path:       windows.UTF16ToString(drivePath),
-			Type:       driveType,
-			VolumeName: volumeName,
+		partition := &Partition{
+			Name:       name,
+			Path:       strings.TrimRight(windows.UTF16ToString(partitionPath), `\`),
+			Removable:  driveType == windows.DRIVE_REMOVABLE,
 			FileSystem: fileSystem,
-		})
+		}
+
+		drivePath, err := getDrivePath(partition.Path)
+		if err != nil {
+			continue
+		}
+
+		if drive, ok := drives[drivePath]; ok {
+			drive.Partitions = append(drive.Partitions, partition)
+		} else {
+			driveName, err := getDriveName(partition.Path)
+			if err != nil {
+				continue
+			}
+
+			drives[drivePath] = &Drive{
+				Name: driveName,
+				Path: drivePath,
+				Partitions: []*Partition{
+					partition,
+				},
+			}
+		}
+	}
+
+	res := make([]*Drive, 0, len(drives))
+	for _, drive := range drives {
+		res = append(res, drive)
 	}
 
 	return res, nil
 }
 
-func getDriveType(driveType uint32) DriveType {
-	switch driveType {
-	case windows.DRIVE_REMOVABLE:
-		return DriveTypeRemovable
-	case windows.DRIVE_FIXED:
-		return DriveTypeFixed
-	case windows.DRIVE_REMOTE:
-		return DriveTypeRemote
-	case windows.DRIVE_CDROM:
-		return DriveTypeCDRom
-	case windows.DRIVE_RAMDISK:
-		return DriveTypeRAMDisk
-	}
+const (
+	ioctl_storage_get_device_number = 0x002d1080
+	ioctl_storage_query_property    = 0x002d1400
+	storageDeviceProperty           = 0
+	propertyStandardQuery           = 0
+	file_device_disk                = 0x00000007
+)
 
-	return DriveTypeInvalid
+type storagePropertyQuery struct {
+	PropertyId uint
+	QueryType  uint
 }
 
-func getVolumeInformation(rootPathName *uint16) (string, FileSystem, error) {
-	var maximumComponentLength uint32
-	var fileSystemFlags uint32
+type storageDescriptorHeader struct {
+	Version uint32
+	Size    uint32
+}
 
-	volumeName := make([]uint16, windows.MAX_PATH+1)
-	fileSystemName := make([]uint16, windows.MAX_PATH+1)
+type storageDeviceNumber struct {
+	DeviceType      uint32
+	DeviceNumber    uint32
+	PartitionNumber uint32
+}
 
-	err := windows.GetVolumeInformation(rootPathName, &volumeName[0], uint32(len(volumeName)), nil, &maximumComponentLength, &fileSystemFlags, &fileSystemName[0], uint32(len(fileSystemName)))
+func getDriveName(path string) (string, error) {
+	path = fmt.Sprintf(`\\.\%s`, path)
+
+	fd, err := windows.CreateFile(
+		windows.StringToUTF16Ptr(path),
+		0,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE,
+		nil,
+		windows.OPEN_EXISTING,
+		windows.FILE_ATTRIBUTE_NORMAL,
+		0,
+	)
 	if err != nil {
-		return "", FileSystem{}, err
+		return "", err
+	}
+	defer func() {
+		_ = windows.CloseHandle(fd)
+	}()
+
+	spq := storagePropertyQuery{
+		PropertyId: storageDeviceProperty,
+		QueryType:  propertyStandardQuery,
 	}
 
-	return windows.UTF16ToString(volumeName), FileSystem{
-		Name:               windows.UTF16ToString(fileSystemName),
-		Flags:              fileSystemFlags,
-		MaxComponentLength: maximumComponentLength,
-	}, nil
+	var sdh storageDescriptorHeader
+	sdhSize := uint32(unsafe.Sizeof(sdh))
+
+	var bytesReturned uint32
+
+	err = windows.DeviceIoControl(
+		fd,
+		ioctl_storage_query_property,
+		(*byte)(unsafe.Pointer(&spq)),
+		uint32(unsafe.Sizeof(spq)),
+		(*byte)(unsafe.Pointer(&sdh)),
+		sdhSize,
+		&bytesReturned,
+		nil,
+	)
+	if err != nil {
+		return "", err
+	}
+
+	if bytesReturned < sdhSize {
+		return "", errors.New("invalid response")
+	}
+
+	if sdh.Size < 16 {
+		return "", nil
+	}
+
+	buf := make([]byte, sdh.Size)
+
+	err = windows.DeviceIoControl(
+		fd,
+		ioctl_storage_query_property,
+		(*byte)(unsafe.Pointer(&spq)),
+		uint32(unsafe.Sizeof(spq)),
+		&buf[0],
+		sdh.Size,
+		&bytesReturned,
+		nil,
+	)
+	if err != nil {
+		return "", err
+	}
+
+	if bytesReturned < sdh.Size {
+		return "", errors.New("invalid response")
+	}
+
+	var vendorId, productId string
+
+	if offset := *(*uint32)(unsafe.Pointer(&buf[12])); offset > 0 {
+		vendorId = strings.TrimSpace(windows.BytePtrToString(&buf[offset]))
+	}
+
+	if sdh.Size >= 20 {
+		if offset := *(*uint32)(unsafe.Pointer(&buf[16])); offset > 0 {
+			productId = strings.TrimSpace(windows.BytePtrToString(&buf[offset]))
+		}
+	}
+
+	if vendorId != "" {
+		if productId != "" {
+			return fmt.Sprintf("%s %s", vendorId, productId), nil
+		}
+
+		return vendorId, nil
+	}
+
+	return productId, nil
+}
+
+func getDrivePath(path string) (string, error) {
+	path = fmt.Sprintf(`\\.\%s`, path)
+
+	fd, err := windows.CreateFile(
+		windows.StringToUTF16Ptr(path),
+		0,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE,
+		nil,
+		windows.OPEN_EXISTING,
+		windows.FILE_ATTRIBUTE_NORMAL,
+		0,
+	)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		_ = windows.CloseHandle(fd)
+	}()
+
+	var sdn storageDeviceNumber
+	sdnSize := uint32(unsafe.Sizeof(sdn))
+
+	var bytesReturned uint32
+
+	err = windows.DeviceIoControl(
+		fd,
+		ioctl_storage_get_device_number,
+		nil,
+		0,
+		(*byte)(unsafe.Pointer(&sdn)),
+		sdnSize,
+		&bytesReturned,
+		nil,
+	)
+	if err != nil {
+		return "", err
+	}
+
+	if bytesReturned < sdnSize {
+		return "", errors.New("invalid response")
+	}
+
+	if sdn.DeviceType != file_device_disk {
+		return "", errors.New("invalid device")
+	}
+
+	return fmt.Sprintf(`\\.\PhysicalDrive%d`, sdn.DeviceNumber), nil
 }

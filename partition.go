@@ -4,25 +4,23 @@
 package windrive
 
 import (
+	"fmt"
+
 	"golang.org/x/sys/windows"
 )
 
-// Paths returns the path of every available drive.
-func Paths() ([]string, error) {
-	drivePaths, err := getDrivePaths()
-	if err != nil {
-		return nil, err
-	}
-
-	res := make([]string, 0, len(drivePaths))
-	for _, drivePath := range drivePaths {
-		res = append(res, windows.UTF16ToString(drivePath))
-	}
-
-	return res, nil
+type Partition struct {
+	Name       string
+	Path       string
+	Removable  bool
+	FileSystem FileSystem
 }
 
-func getDrivePaths() ([][]uint16, error) {
+func (p Partition) String() string {
+	return fmt.Sprintf("%s (%s)", p.Name, p.Path)
+}
+
+func getPartitionsPath() ([][]uint16, error) {
 	buf := make([]uint16, 128)
 
 	for {
