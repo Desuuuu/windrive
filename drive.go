@@ -149,7 +149,7 @@ func getDriveName(path string) (string, error) {
 	}
 
 	if bytesReturned < sdhSize {
-		return "", errors.New("invalid response")
+		return "", nil
 	}
 
 	if sdh.Size < 16 {
@@ -173,17 +173,17 @@ func getDriveName(path string) (string, error) {
 	}
 
 	if bytesReturned < sdh.Size {
-		return "", errors.New("invalid response")
+		return "", nil
 	}
 
 	var vendorId, productId string
 
-	if offset := *(*uint32)(unsafe.Pointer(&buf[12])); offset > 0 {
+	if offset := *(*uint32)(unsafe.Pointer(&buf[12])); offset > 0 && offset < sdh.Size {
 		vendorId = strings.TrimSpace(windows.BytePtrToString(&buf[offset]))
 	}
 
 	if sdh.Size >= 20 {
-		if offset := *(*uint32)(unsafe.Pointer(&buf[16])); offset > 0 {
+		if offset := *(*uint32)(unsafe.Pointer(&buf[16])); offset > 0 && offset < sdh.Size {
 			productId = strings.TrimSpace(windows.BytePtrToString(&buf[offset]))
 		}
 	}
