@@ -22,6 +22,16 @@ func (d Drive) String() string {
 	return d.Name
 }
 
+func (d Drive) IsRemovable() bool {
+	for _, partition := range d.Partitions {
+		if !partition.Removable {
+			return false
+		}
+	}
+
+	return true
+}
+
 // List returns the physical drives currently connected. Drives without any
 // partition are not included.
 func List() ([]*Drive, error) {
