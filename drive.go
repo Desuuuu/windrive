@@ -60,16 +60,23 @@ func List() ([]*Drive, error) {
 			FileSystem: fileSystem,
 		}
 
-		drivePath, err := getDrivePath(partition.Path)
+		fd, err := openDrive(partition.Path)
 		if err != nil {
+			continue
+		}
+
+		drivePath, err := getDrivePath(fd)
+		if err != nil {
+			_ = windows.CloseHandle(fd)
 			continue
 		}
 
 		if drive, ok := drives[drivePath]; ok {
 			drive.Partitions = append(drive.Partitions, partition)
 		} else {
-			driveName, err := getDriveName(partition.Path)
+			driveName, err := getDriveName(fd)
 			if err != nil {
+				_ = windows.CloseHandle(fd)
 				continue
 			}
 
@@ -81,6 +88,8 @@ func List() ([]*Drive, error) {
 				},
 			}
 		}
+
+		_ = windows.CloseHandle(fd)
 	}
 
 	res := make([]*Drive, 0, len(drives))
@@ -99,26 +108,10 @@ const (
 	file_device_disk                = 0x00000007
 )
 
-type storagePropertyQuery struct {
-	PropertyId uint
-	QueryType  uint
-}
-
-type storageDescriptorHeader struct {
-	Version uint32
-	Size    uint32
-}
-
-type storageDeviceNumber struct {
-	DeviceType      uint32
-	DeviceNumber    uint32
-	PartitionNumber uint32
-}
-
-func getDriveName(path string) (string, error) {
+func openDrive(path string) (windows.Handle, error) {
 	path = fmt.Sprintf(`\\.\%s`, path)
 
-	fd, err := windows.CreateFile(
+	return windows.CreateFile(
 		windows.StringToUTF16Ptr(path),
 		0,
 		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE,
@@ -127,13 +120,57 @@ func getDriveName(path string) (string, error) {
 		windows.FILE_ATTRIBUTE_NORMAL,
 		0,
 	)
+}
+
+type storageDeviceNumber struct {
+	DeviceType      uint32
+	DeviceNumber    uint32
+	PartitionNumber uint32
+}
+
+func getDrivePath(fd windows.Handle) (string, error) {
+	var sdn storageDeviceNumber
+	sdnSize := uint32(unsafe.Sizeof(sdn))
+
+	var bytesReturned uint32
+
+	err := windows.DeviceIoControl(
+		fd,
+		ioctl_storage_get_device_number,
+		nil,
+		0,
+		(*byte)(unsafe.Pointer(&sdn)),
+		sdnSize,
+		&bytesReturned,
+		nil,
+	)
 	if err != nil {
 		return "", err
 	}
-	defer func() {
-		_ = windows.CloseHandle(fd)
-	}()
 
+	if bytesReturned < sdnSize {
+		return "", errors.New("invalid response")
+	}
+
+	if sdn.DeviceType != file_device_disk {
+		return "", errors.New("invalid device")
+	}
+
+	return fmt.Sprintf(`\\.\PhysicalDrive%d`, sdn.DeviceNumber), nil
+}
+
+type storagePropertyQuery struct {
+	PropertyId           uint32
+	QueryType            uint32
+	AdditionalParameters uint8
+}
+
+type storageDescriptorHeader struct {
+	Version uint32
+	Size    uint32
+}
+
+func getDriveName(fd windows.Handle) (string, error) {
 	spq := storagePropertyQuery{
 		PropertyId: storageDeviceProperty,
 		QueryType:  propertyStandardQuery,
@@ -144,7 +181,7 @@ func getDriveName(path string) (string, error) {
 
 	var bytesReturned uint32
 
-	err = windows.DeviceIoControl(
+	err := windows.DeviceIoControl(
 		fd,
 		ioctl_storage_query_property,
 		(*byte)(unsafe.Pointer(&spq)),
@@ -207,53 +244,4 @@ func getDriveName(path string) (string, error) {
 	}
 
 	return productId, nil
-}
-
-func getDrivePath(path string) (string, error) {
-	path = fmt.Sprintf(`\\.\%s`, path)
-
-	fd, err := windows.CreateFile(
-		windows.StringToUTF16Ptr(path),
-		0,
-		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE,
-		nil,
-		windows.OPEN_EXISTING,
-		windows.FILE_ATTRIBUTE_NORMAL,
-		0,
-	)
-	if err != nil {
-		return "", err
-	}
-	defer func() {
-		_ = windows.CloseHandle(fd)
-	}()
-
-	var sdn storageDeviceNumber
-	sdnSize := uint32(unsafe.Sizeof(sdn))
-
-	var bytesReturned uint32
-
-	err = windows.DeviceIoControl(
-		fd,
-		ioctl_storage_get_device_number,
-		nil,
-		0,
-		(*byte)(unsafe.Pointer(&sdn)),
-		sdnSize,
-		&bytesReturned,
-		nil,
-	)
-	if err != nil {
-		return "", err
-	}
-
-	if bytesReturned < sdnSize {
-		return "", errors.New("invalid response")
-	}
-
-	if sdn.DeviceType != file_device_disk {
-		return "", errors.New("invalid device")
-	}
-
-	return fmt.Sprintf(`\\.\PhysicalDrive%d`, sdn.DeviceNumber), nil
 }
