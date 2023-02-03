@@ -15,6 +15,7 @@ import (
 type Drive struct {
 	Name       string
 	Path       string
+	Size       int64
 	Partitions []*Partition
 }
 
@@ -80,9 +81,16 @@ func List() ([]*Drive, error) {
 				continue
 			}
 
+			driveSize, err := getDriveSize(fd)
+			if err != nil {
+				_ = windows.CloseHandle(fd)
+				continue
+			}
+
 			drives[drivePath] = &Drive{
 				Name: driveName,
 				Path: drivePath,
+				Size: driveSize,
 				Partitions: []*Partition{
 					partition,
 				},
@@ -101,11 +109,12 @@ func List() ([]*Drive, error) {
 }
 
 const (
-	ioctl_storage_get_device_number = 0x002d1080
-	ioctl_storage_query_property    = 0x002d1400
-	storageDeviceProperty           = 0
-	propertyStandardQuery           = 0
-	file_device_disk                = 0x00000007
+	ioctl_disk_get_drive_geometry_ex = 0x000700a0
+	ioctl_storage_get_device_number  = 0x002d1080
+	ioctl_storage_query_property     = 0x002d1400
+	storageDeviceProperty            = 0
+	propertyStandardQuery            = 0
+	file_device_disk                 = 0x00000007
 )
 
 func openDrive(path string) (windows.Handle, error) {
@@ -244,4 +253,40 @@ func getDriveName(fd windows.Handle) (string, error) {
 	}
 
 	return productId, nil
+}
+
+type diskGeometryEx struct {
+	Cylinders         int64
+	MediaType         uint32
+	TracksPerCylinder uint32
+	SectorsPerTrack   uint32
+	BytesPerSector    uint32
+	DiskSize          int64
+}
+
+func getDriveSize(fd windows.Handle) (int64, error) {
+	var dge diskGeometryEx
+	dgeSize := uint32(unsafe.Sizeof(dge))
+
+	var bytesReturned uint32
+
+	err := windows.DeviceIoControl(
+		fd,
+		ioctl_disk_get_drive_geometry_ex,
+		nil,
+		0,
+		(*byte)(unsafe.Pointer(&dge)),
+		dgeSize,
+		&bytesReturned,
+		nil,
+	)
+	if err != nil {
+		return 0, err
+	}
+
+	if bytesReturned < dgeSize {
+		return 0, nil
+	}
+
+	return dge.DiskSize, nil
 }
